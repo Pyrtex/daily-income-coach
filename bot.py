@@ -1,37 +1,26 @@
 import os
 import sqlite3
 import random
-from datetime import datetime, time
-from zoneinfo import ZoneInfo
-
+from datetime import time
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from zoneinfo import ZoneInfo
 
 DB_FILE = "data.db"
 
 QUOTES = [
-    "Discipline beats motivation.",
-    "Small steps every day compound into big results.",
-    "Action creates clarity.",
-    "Progress > perfection.",
-    "Consistency is a superpower.",
-    "Focus on the next action, not the whole mountain.",
-    "Your income follows your value — build value daily.",
-    "Start before you feel ready.",
-    "What gets measured gets improved.",
-    "Done is better than perfect."
+    "Discipline is choosing between what you want now and what you want most.",
+    "Success is the sum of small efforts repeated day in and day out.",
+    "Don't watch the clock; do what it does. Keep going.",
+    "Your future is created by what you do today, not tomorrow.",
+    "Small progress is still progress."
 ]
 
 def load_token():
     token = os.getenv("BOT_TOKEN")
-    if token:
-        return token
-    if os.path.exists(".env"):
-        with open(".env") as f:
-            for line in f:
-                if line.startswith("BOT_TOKEN="):
-                    return line.split("=",1)[1].strip()
-    raise RuntimeError("BOT_TOKEN not found")
+    if not token:
+        raise RuntimeError("BOT_TOKEN not found")
+    return token
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -39,171 +28,77 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            streak INTEGER DEFAULT 0,
-            last_day TEXT,
-            tz TEXT DEFAULT 'Europe/Vilnius'
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS daily_quote (
-            day TEXT PRIMARY KEY,
-            quote TEXT NOT NULL
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS sent_flags (
-            user_id INTEGER,
-            day TEXT,
-            kind TEXT,
-            PRIMARY KEY(user_id, day, kind)
+            timezone TEXT
         )
     """)
     conn.commit()
     conn.close()
 
-def get_user(user_id):
+def get_user_tz(user_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT streak, last_day, tz FROM users WHERE user_id=?", (user_id,))
+    c.execute("SELECT timezone FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
     conn.close()
-    if not row:
-        return 0, None, "Europe/Vilnius"
-    return row[0], row[1], row[2]
+    return row[0] if row else None
 
-def save_user(user_id, streak, last_day, tz):
+def set_user_tz(user_id, tz):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO users(user_id, streak, last_day, tz)
-        VALUES(?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            streak=excluded.streak,
-            last_day=excluded.last_day,
-            tz=excluded.tz
-    """, (user_id, streak, last_day, tz))
-    conn.commit()
-    conn.close()
-
-def get_or_set_daily_quote(day):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT quote FROM daily_quote WHERE day=?", (day,))
-    row = c.fetchone()
-    if row:
-        conn.close()
-        return row[0]
-    q = random.choice(QUOTES)
-    c.execute("INSERT INTO daily_quote(day, quote) VALUES(?,?)", (day, q))
-    conn.commit()
-    conn.close()
-    return q
-
-def today_str(tz):
-    return datetime.now(tz).strftime("%Y-%m-%d")
-
-def was_sent(user_id, day, kind):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM sent_flags WHERE user_id=? AND day=? AND kind=?", (user_id, day, kind))
-    r = c.fetchone()
-    conn.close()
-    return bool(r)
-
-def mark_sent(user_id, day, kind):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO sent_flags VALUES(?,?,?)", (user_id, day, kind))
+    c.execute("INSERT OR REPLACE INTO users (user_id, timezone) VALUES (?, ?)", (user_id, tz))
     conn.commit()
     conn.close()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Daily Income Coach ✅\n\n"
-        "Set your timezone:\n"
-        "/settz Europe/Vilnius\n"
-        "/settz Europe/London\n"
-        "/settz America/New_York\n\n"
-        "Commands:\n"
-        "/morning\n"
-        "/evening\n"
-        "/quote"
-    )
+    await update.message.reply_text("Send /settz Europe/Vilnius to set your timezone.")
 
 async def settz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /settz Europe/Vilnius")
+        await update.message.reply_text("Example: /settz Europe/Vilnius")
         return
-    tzname = context.args[0]
+    tz = context.args[0]
     try:
-        ZoneInfo(tzname)
-    except Exception:
-        await update.message.reply_text("Invalid timezone. Example: Europe/Vilnius")
+        ZoneInfo(tz)
+    except:
+        await update.message.reply_text("Invalid timezone.")
         return
-    streak, last_day, _ = get_user(update.effective_user.id)
-    save_user(update.effective_user.id, streak, last_day, tzname)
-    await update.message.reply_text(f"Timezone set to {tzname}")
+    set_user_tz(update.effective_user.id, tz)
+    await update.message.reply_text(f"Timezone set to {tz}")
 
-async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, _, tzname = get_user(update.effective_user.id)
-    tz = ZoneInfo(tzname)
-    day = today_str(tz)
-    q = get_or_set_daily_quote(day)
-    await update.message.reply_text(
-        f"☀️ Morning\n\n💬 Quote of the day:\n“{q}”\n\n"
-        "What ONE thing will you do today to increase your income?"
+async def morning_job(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=context.job.chat_id,
+        text="🌅 Morning. What ONE thing will you do today to increase your income?"
     )
 
-async def evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, _, tzname = get_user(update.effective_user.id)
-    tz = ZoneInfo(tzname)
-    day = today_str(tz)
-    q = get_or_set_daily_quote(day)
-    await update.message.reply_text(
-        f"🌙 Evening\n\n💬 Quote of the day:\n“{q}”\n\n"
-        "What did you do today to increase your income?"
+async def midday_job(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=context.job.chat_id,
+        text="🕛 Are you working today toward your main goal?"
     )
 
-async def quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, _, tzname = get_user(update.effective_user.id)
-    tz = ZoneInfo(tzname)
-    day = today_str(tz)
-    q = get_or_set_daily_quote(day)
-    await update.message.reply_text(f"💬 Quote of the day:\n“{q}”")
+async def evening_job(context: ContextTypes.DEFAULT_TYPE):
+    quote = random.choice(QUOTES)
+    await context.bot.send_message(
+        chat_id=context.job.chat_id,
+        text=f"🌙 Evening reflection.\nQuote of the day:\n\n\"{quote}\""
+    )
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def register_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    streak, last_day, tzname = get_user(user_id)
-    tz = ZoneInfo(tzname)
-    today = today_str(tz)
-    if last_day != today:
-        streak += 1
-    save_user(user_id, streak, today, tzname)
-    await update.message.reply_text(f"🔥 Streak: {streak}")
+    tz = get_user_tz(user_id)
+    if not tz:
+        await update.message.reply_text("Set timezone first with /settz Europe/Vilnius")
+        return
 
-async def scheduler(context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT user_id, tz FROM users")
-    users = c.fetchall()
-    conn.close()
+    tzinfo = ZoneInfo(tz)
 
-    for uid, tzname in users:
-        tz = ZoneInfo(tzname)
-        now = datetime.now(tz)
-        day = today_str(tz)
+    jq = context.application.job_queue
+    jq.run_daily(morning_job, time=time(9,0,tzinfo=tzinfo), chat_id=user_id)
+    jq.run_daily(midday_job, time=time(12,0,tzinfo=tzinfo), chat_id=user_id)
+    jq.run_daily(evening_job, time=time(20,0,tzinfo=tzinfo), chat_id=user_id)
 
-        if now.hour == 8 and not was_sent(uid, day, "morning"):
-            mark_sent(uid, day, "morning")
-            await context.bot.send_message(uid, "☀️ Morning! Use /morning")
-
-        if now.hour == 12 and not was_sent(uid, day, "midday"):
-            mark_sent(uid, day, "midday")
-            await context.bot.send_message(uid, "🕛 Are you working today to reach your goal?")
-
-        if now.hour == 21 and not was_sent(uid, day, "evening"):
-            mark_sent(uid, day, "evening")
-            await context.bot.send_message(uid, "🌙 Evening! Use /evening")
+    await update.message.reply_text("Daily reminders registered.")
 
 def main():
     init_db()
@@ -212,12 +107,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("settz", settz))
-    app.add_handler(CommandHandler("morning", morning))
-    app.add_handler(CommandHandler("evening", evening))
-    app.add_handler(CommandHandler("quote", quote))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    app.job_queue.run_repeating(scheduler, interval=60, first=10)
+    app.add_handler(CommandHandler("register", register_jobs))
 
     print("Bot started")
     app.run_polling()
