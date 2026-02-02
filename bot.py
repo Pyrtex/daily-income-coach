@@ -2,7 +2,7 @@ import os
 import sqlite3
 import random
 import logging
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
 from telegram import (
@@ -32,14 +32,18 @@ DB_FILE = "data.db"
 TRIAL_DAYS = 3
 SUB_DAYS = 30
 
-# local schedule for each user's chosen timezone
-DEFAULT_SCHEDULE_HOURS = (8, 12, 20)  # 08:00 / 12:00 / 20:00 local time
+DEFAULT_SCHEDULE_HOURS = (8, 12, 20)  # local time: 08:00 / 12:00 / 20:00
 
+# Quotes with authors (text, author)
 QUOTES = [
-    "Discipline beats motivation.",
-    "Small steps every day.",
-    "Focus on the next action, not the whole mountain.",
-    "Your habits decide your future.",
+    ("Discipline is choosing between what you want now and what you want most.", "Abraham Lincoln"),
+    ("We are what we repeatedly do. Excellence, then, is not an act, but a habit.", "Will Durant"),
+    ("The secret of getting ahead is getting started.", "Mark Twain"),
+    ("It always seems impossible until it’s done.", "Nelson Mandela"),
+    ("Success is the product of daily habits—not once-in-a-lifetime transformations.", "James Clear"),
+    ("If you are not willing to risk the usual, you will have to settle for the ordinary.", "Jim Rohn"),
+    ("Action is the foundational key to all success.", "Pablo Picasso"),
+    ("Do what you can, with what you have, where you are.", "Theodore Roosevelt"),
 ]
 
 # Logging (Render logs)
@@ -48,6 +52,33 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("daily-income-coach")
+
+
+# =========================
+# TIME HELPERS
+# =========================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def dt_from_iso(s: str) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def dt_to_iso(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 # =========================
@@ -64,6 +95,7 @@ def get_bot_token() -> str:
     token = env("BOT_TOKEN")
     if token:
         return token
+
     # Optional local .env support
     if os.path.exists(".env"):
         with open(".env", "r", encoding="utf-8") as f:
@@ -71,11 +103,12 @@ def get_bot_token() -> str:
                 line = line.strip()
                 if line.startswith("BOT_TOKEN="):
                     return line.split("=", 1)[1].strip()
+
     raise RuntimeError("BOT_TOKEN not found (set BOT_TOKEN in environment or .env)")
 
 
 def get_admin_ids() -> set[int]:
-    raw = env("ADMIN_IDS", "") or ""
+    raw = env("ADMIN_IDS", "")
     ids = set()
     for part in raw.split(","):
         part = part.strip()
@@ -101,15 +134,12 @@ def get_payment_currency() -> str:
 
 
 def get_sub_price() -> str:
-    # stored as string like "5.99"
     return env("SUB_PRICE", "5.99") or "5.99"
 
 
 def price_to_minor_units(price_str: str) -> int:
-    """
-    For USD: 5.99 -> 599 (cents)
-    We assume 2-decimal currency.
-    """
+    # For USD: 5.99 -> 599 (cents)
+    # This assumes a 2-decimal currency (USD/EUR/GBP etc.)
     try:
         value = float(price_str.replace(",", "."))
     except Exception:
@@ -134,20 +164,24 @@ def init_db():
           user_id INTEGER PRIMARY KEY,
           timezone TEXT,
           trial_start TEXT,
-          subscription_until TEXT
+          subscription_until TEXT,
+          last_prompt TEXT,
+          last_prompt_at TEXT
         )
         """
     )
-
-    # migration safety
+    # Simple migration: ensure columns exist
     c.execute("PRAGMA table_info(users)")
     cols = {row[1] for row in c.fetchall()}
-    if "timezone" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN timezone TEXT")
+
     if "trial_start" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN trial_start TEXT")
     if "subscription_until" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN subscription_until TEXT")
+    if "last_prompt" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN last_prompt TEXT")
+    if "last_prompt_at" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN last_prompt_at TEXT")
 
     conn.commit()
     conn.close()
@@ -160,14 +194,14 @@ def ensure_user(user_id: int):
     row = c.fetchone()
     if not row:
         c.execute(
-            "INSERT INTO users(user_id, timezone, trial_start, subscription_until) VALUES(?, ?, ?, ?)",
-            (user_id, None, datetime.utcnow().isoformat(), None),
+            "INSERT INTO users(user_id, timezone, trial_start, subscription_until, last_prompt, last_prompt_at) VALUES(?, ?, ?, ?, ?, ?)",
+            (user_id, None, dt_to_iso(now_utc()), None, None, None),
         )
     else:
         if not row[1]:
             c.execute(
                 "UPDATE users SET trial_start=? WHERE user_id=?",
-                (datetime.utcnow().isoformat(), user_id),
+                (dt_to_iso(now_utc()), user_id),
             )
     conn.commit()
     conn.close()
@@ -197,12 +231,7 @@ def get_trial_start(user_id: int) -> datetime | None:
     c.execute("SELECT trial_start FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
     conn.close()
-    if not row or not row[0]:
-        return None
-    try:
-        return datetime.fromisoformat(row[0])
-    except Exception:
-        return None
+    return dt_from_iso(row[0]) if row and row[0] else None
 
 
 def get_subscription_until(user_id: int) -> datetime | None:
@@ -211,12 +240,7 @@ def get_subscription_until(user_id: int) -> datetime | None:
     c.execute("SELECT subscription_until FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
     conn.close()
-    if not row or not row[0]:
-        return None
-    try:
-        return datetime.fromisoformat(row[0])
-    except Exception:
-        return None
+    return dt_from_iso(row[0]) if row and row[0] else None
 
 
 def set_subscription_until(user_id: int, until_dt: datetime | None):
@@ -225,14 +249,14 @@ def set_subscription_until(user_id: int, until_dt: datetime | None):
     c = conn.cursor()
     c.execute(
         "UPDATE users SET subscription_until=? WHERE user_id=?",
-        (until_dt.isoformat() if until_dt else None, user_id),
+        (dt_to_iso(until_dt), user_id),
     )
     conn.commit()
     conn.close()
 
 
-def extend_subscription(user_id: int, days: int) -> datetime:
-    now = datetime.utcnow()
+def extend_subscription(user_id: int, days: int):
+    now = now_utc()
     current = get_subscription_until(user_id)
     base = current if current and current > now else now
     new_until = base + timedelta(days=days)
@@ -240,26 +264,39 @@ def extend_subscription(user_id: int, days: int) -> datetime:
     return new_until
 
 
-def format_timedelta(td: timedelta) -> str:
-    total_seconds = int(td.total_seconds())
-    if total_seconds < 0:
-        total_seconds = 0
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    mins = (total_seconds % 3600) // 60
-    if days > 0:
-        return f"{days}d {hours}h"
-    if hours > 0:
-        return f"{hours}h {mins}m"
-    return f"{mins}m"
+def set_last_prompt(user_id: int, prompt_type: str):
+    ensure_user(user_id)
+    conn = db_connect()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET last_prompt=?, last_prompt_at=? WHERE user_id=?",
+        (prompt_type, dt_to_iso(now_utc()), user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_last_prompt(user_id: int) -> tuple[str | None, datetime | None]:
+    conn = db_connect()
+    c = conn.cursor()
+    c.execute("SELECT last_prompt, last_prompt_at FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None, None
+    return (row[0] if row[0] else None, dt_from_iso(row[1]) if row[1] else None)
 
 
 def access_state(user_id: int) -> tuple[bool, str]:
     """
     Returns (allowed, label)
+    label examples:
+    - "Subscription (12d 3h left)"
+    - "Trial (2d 23h left)"
+    - "Expired"
     """
     ensure_user(user_id)
-    now = datetime.utcnow()
+    now = now_utc()
 
     sub_until = get_subscription_until(user_id)
     if sub_until and sub_until > now:
@@ -274,6 +311,20 @@ def access_state(user_id: int) -> tuple[bool, str]:
             return True, f"Trial ({format_timedelta(left)} left)"
 
     return False, "Expired"
+
+
+def format_timedelta(td: timedelta) -> str:
+    total_seconds = int(td.total_seconds())
+    if total_seconds < 0:
+        total_seconds = 0
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    mins = (total_seconds % 3600) // 60
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
 
 
 # =========================
@@ -305,18 +356,15 @@ def build_timezone_keyboard() -> InlineKeyboardMarkup:
 # =========================
 # SCHEDULING
 # =========================
-def remove_jobs_for_user(app: Application, user_id: int):
+def reschedule(app: Application, user_id: int, tz_name: str):
+    tz = ZoneInfo(tz_name)
+
+    # Remove previous jobs for this user
     for job in app.job_queue.jobs():
         if job.name and job.name.startswith(f"user:{user_id}:"):
             job.schedule_removal()
 
-
-def reschedule(app: Application, user_id: int, tz_name: str):
-    tz = ZoneInfo(tz_name)
-
-    remove_jobs_for_user(app, user_id)
-
-    # PTB: use time= with tzinfo inside datetime.time, NOT timezone=...
+    # PTB JobQueue uses time with tzinfo (NOT timezone=...)
     app.job_queue.run_daily(
         morning_job,
         time=dtime(hour=DEFAULT_SCHEDULE_HOURS[0], minute=0, tzinfo=tz),
@@ -337,15 +385,28 @@ def reschedule(app: Application, user_id: int, tz_name: str):
     )
 
 
+def make_quote() -> tuple[str, str]:
+    text, author = random.choice(QUOTES)
+    return text, author
+
+
 async def morning_job(ctx: ContextTypes.DEFAULT_TYPE):
     user_id = ctx.job.data["user_id"]
     allowed, _ = access_state(user_id)
     if not allowed:
         return
-    quote = random.choice(QUOTES)
+
+    quote, author = make_quote()
+    set_last_prompt(user_id, "morning")
+
     await ctx.bot.send_message(
         chat_id=user_id,
-        text=f"☀️ Morning quote:\n“{quote}”\n\nWhat ONE thing will you do today to increase your income?",
+        text=(
+            "☀️ Morning quote:\n"
+            f"“{quote}”\n"
+            f"— {author}\n\n"
+            "What ONE thing will you do today to increase your income?"
+        ),
     )
 
 
@@ -354,6 +415,9 @@ async def midday_job(ctx: ContextTypes.DEFAULT_TYPE):
     allowed, _ = access_state(user_id)
     if not allowed:
         return
+
+    set_last_prompt(user_id, "midday")
+
     await ctx.bot.send_message(
         chat_id=user_id,
         text="🕛 Midday check: What have you done so far today to move toward your goal?",
@@ -365,11 +429,48 @@ async def evening_job(ctx: ContextTypes.DEFAULT_TYPE):
     allowed, _ = access_state(user_id)
     if not allowed:
         return
-    quote = random.choice(QUOTES)
+
+    quote, author = make_quote()
+    set_last_prompt(user_id, "evening")
+
     await ctx.bot.send_message(
         chat_id=user_id,
-        text=f"🌙 Evening quote:\n“{quote}”\n\nWhat did you do today that moved you closer to your goal?",
+        text=(
+            "🌙 Evening quote:\n"
+            f"“{quote}”\n"
+            f"— {author}\n\n"
+            "What did you do today that moved you closer to your goal?"
+        ),
     )
+
+
+# =========================
+# REACTION LOGIC
+# =========================
+def reaction_for(prompt_type: str | None, user_text: str) -> str:
+    t = (user_text or "").strip()
+    low = t.lower()
+
+    if not t:
+        return "Got it. If you want, send one sentence — what exactly happened?"
+
+    # very short / vague answers
+    if len(t) <= 3 or low in {"ok", "yes", "no", "nothing", "none", "idk"}:
+        return "Thanks. Make it specific: what is the next *small* action (5–10 minutes) you can do now?"
+
+    if "nothing" in low or "didn't" in low or "cant" in low or "can't" in low:
+        return "Honest. Pick the smallest step: send 1 message, make 1 call, or apply to 1 job. Which one will you do?"
+
+    # prompt-specific reactions
+    if prompt_type == "morning":
+        return "Nice. Lock it in: when exactly will you do it today (time + place)?"
+    if prompt_type == "midday":
+        return "Good. What is the next step you will do *before the next hour*?"
+    if prompt_type == "evening":
+        return "Good job. What will you improve tomorrow (one change, not a list)?"
+
+    # fallback
+    return "Got it. What is your next small step?"
 
 
 # =========================
@@ -386,31 +487,23 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/whoami — show your user_id\n"
         "/help — this help\n"
     )
-    await update.message.reply_text(
-        msg,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu_keyboard(),
-    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
 
 
 async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     admin = "YES" if is_admin(uid) else "NO"
-    await update.message.reply_text(
-        f"Your user_id: {uid}\nAdmin: {admin}",
-        reply_markup=main_menu_keyboard(),
-    )
+    await update.message.reply_text(f"Your user_id: {uid}\nAdmin: {admin}", reply_markup=main_menu_keyboard())
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     ensure_user(user_id)
 
-    # show menu always on first entry
     tz = get_timezone(user_id)
     if not tz:
         await update.message.reply_text(
-            "Welcome!\n\n1) Choose your time zone with /timezone\n2) Then type /start again",
+            "Welcome! First, set your time zone so reminders arrive at the right local time.\n\nUse /timezone.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -425,9 +518,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     reschedule(ctx.application, user_id, tz)
     await update.message.reply_text(
-        f"✅ Schedule is active (08:00 / 12:00 / 20:00 local time).\n"
+        "✅ Schedule is active (08:00 / 12:00 / 20:00 local time).\n"
         f"Access: ✅ {label}\n"
-        f"Use /timezone to change your time zone.",
+        "Use /timezone to change your time zone.",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -438,19 +531,15 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     tz = get_timezone(user_id) or "Not set"
     allowed, label = access_state(user_id)
-
     schedule_line = "08:00 / 12:00 / 20:00 (local)" if tz != "Not set" else "Not active (set /timezone)"
+
     msg = (
         "📌 *Status*\n"
         f"- Time zone: `{tz}`\n"
         f"- Access: {'✅ ' if allowed else '⛔ '} {label}\n"
         f"- Schedule: {schedule_line}\n"
     )
-    await update.message.reply_text(
-        msg,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu_keyboard(),
-    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
 
 
 async def timezone_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -477,13 +566,13 @@ async def tz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         f"✅ Time zone saved: {tz_name}\n"
         f"Access: {'✅ ' if allowed else '⛔ '} {label}\n"
-        f"Schedule: 08:00 / 12:00 / 20:00 (your local time)."
+        "Schedule: 08:00 / 12:00 / 20:00 (your local time)."
     )
     await query.edit_message_text(text)
 
 
 # =========================
-# PAYMENTS (TELEGRAM PAYMENTS via Smart Glocal)
+# PAYMENTS (TELEGRAM PAYMENTS)
 # =========================
 async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
@@ -496,7 +585,7 @@ async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     provider_token = get_payment_provider_token()
     if not provider_token:
         await update.message.reply_text(
-            "⚠️ Payments are not configured yet (PAYMENT_PROVIDER_TOKEN missing).",
+            "⚠️ Payments are not configured yet.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -506,9 +595,8 @@ async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     title = "Daily Income Coach — 30-day access"
     description = "Unlock full access for 30 days. Schedule: 08:00 / 12:00 / 20:00 (local time)."
-
     prices = [LabeledPrice(label="30-day subscription", amount=price_minor)]
-    payload = f"sub:{user_id}:{int(datetime.utcnow().timestamp())}"
+    payload = f"sub:{user_id}:{int(now_utc().timestamp())}"
 
     await ctx.bot.send_invoice(
         chat_id=user_id,
@@ -523,7 +611,6 @@ async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def precheckout_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Telegram requires answering pre-checkout queries
     query = update.pre_checkout_query
     try:
         await query.answer(ok=True)
@@ -532,21 +619,19 @@ async def precheckout_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def successful_payment_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Payment succeeded -> extend subscription and (re)schedule if timezone exists.
-    """
     user_id = update.effective_user.id
     ensure_user(user_id)
 
     new_until = extend_subscription(user_id, SUB_DAYS)
     tz = get_timezone(user_id)
+
     if tz:
         try:
             reschedule(ctx.application, user_id, tz)
         except Exception as e:
             log.exception("Reschedule failed after payment: %s", e)
 
-    until_str = new_until.strftime("%Y-%m-%d %H:%M UTC")
+    until_str = new_until.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     msg = (
         "✅ Payment received.\n"
         f"Subscription active until: {until_str}\n\n"
@@ -565,6 +650,7 @@ def require_admin(func):
             await update.message.reply_text("⛔ Admin only.", reply_markup=main_menu_keyboard())
             return
         return await func(update, ctx)
+
     return wrapper
 
 
@@ -647,7 +733,11 @@ async def revoke(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     set_subscription_until(target_id, None)
-    remove_jobs_for_user(ctx.application, target_id)
+
+    # remove jobs
+    for job in ctx.application.job_queue.jobs():
+        if job.name and job.name.startswith(f"user:{target_id}:"):
+            job.schedule_removal()
 
     await update.message.reply_text(f"✅ Revoked subscription for user {target_id}.", reply_markup=main_menu_keyboard())
     try:
@@ -657,10 +747,29 @@ async def revoke(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# MESSAGE HANDLER
+# MESSAGE HANDLER (REACTION)
 # =========================
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Use the menu buttons or type /help.", reply_markup=main_menu_keyboard())
+    user_id = update.effective_user.id
+    ensure_user(user_id)
+
+    allowed, label = access_state(user_id)
+    if not allowed:
+        await update.message.reply_text(
+            "⛔ Access expired.\nUse /subscribe to unlock access.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    user_text = update.message.text or ""
+    prompt_type, prompt_at = get_last_prompt(user_id)
+
+    # If user replies long after prompt, treat it as general message
+    if prompt_at and (now_utc() - prompt_at) > timedelta(hours=18):
+        prompt_type = None
+
+    reply = reaction_for(prompt_type, user_text)
+    await update.message.reply_text(reply, reply_markup=main_menu_keyboard())
 
 
 # =========================
